@@ -117,7 +117,9 @@ class OIDCOAuthProvider(OauthAdapter):
             if not token_response.get("access_token") or not self.nonce or not self.signing_algorithms:
                 raise ValueError("Incomplete OIDC token response")
             id_token = token_response["id_token"]
-            key = jwt.PyJWKClient(self.jwks_uri, timeout=15).get_signing_key_from_jwt(id_token)
+            key = jwt.PyJWKClient(
+                self.jwks_uri, timeout=15, headers={"User-Agent": "Plane-OIDC/1.3.1"}
+            ).get_signing_key_from_jwt(id_token)
             self.id_claims = jwt.decode(
                 id_token, key.key, algorithms=self.signing_algorithms,
                 audience=self.client_id, issuer=self.issuer,
@@ -127,7 +129,8 @@ class OIDCOAuthProvider(OauthAdapter):
                 raise ValueError("OIDC nonce mismatch")
             if self.id_claims.get("azp", self.client_id) != self.client_id:
                 raise ValueError("OIDC authorized party mismatch")
-        except (jwt.PyJWTError, ValueError, KeyError, TypeError):
+        except (jwt.PyJWTError, ValueError, KeyError, TypeError) as exc:
+            self.logger.warning("OIDC ID token validation failed: %s", type(exc).__name__)
             raise AuthenticationException(
                 error_code=AUTHENTICATION_ERROR_CODES["OIDC_OAUTH_PROVIDER_ERROR"],
                 error_message="OIDC_OAUTH_PROVIDER_ERROR: Invalid ID token",
