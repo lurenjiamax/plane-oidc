@@ -2,8 +2,13 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 import os
+import secrets
 from datetime import datetime, timedelta
-from urllib.parse import urlencode
+from typing import Any
+from urllib.parse import urlencode, urlparse
+
+import jwt
+from django.conf import settings
 import pytz
 import requests
 
@@ -45,8 +50,14 @@ class OIDCOAuthProvider(OauthAdapter):
 
         # Fetch OIDC discovery document
         try:
-            discovery = requests.get(OIDC_DISCOVERY_URL).json()
-        except Exception:
+            response = requests.get(OIDC_DISCOVERY_URL, timeout=15)
+            response.raise_for_status()
+            discovery = response.json()
+            for key in ("issuer", "token_endpoint", "userinfo_endpoint", "authorization_endpoint", "jwks_uri"):
+                endpoint = urlparse(discovery[key])
+                if endpoint.scheme != "https" or not endpoint.netloc:
+                    raise ValueError("Invalid OIDC endpoint")
+        except (requests.RequestException, ValueError, KeyError, TypeError):
             raise AuthenticationException(
                 error_code=AUTHENTICATION_ERROR_CODES["OIDC_NOT_CONFIGURED"],
                 error_message="OIDC_NOT_CONFIGURED: Failed to fetch discovery document",
@@ -55,14 +66,26 @@ class OIDCOAuthProvider(OauthAdapter):
         self.token_url = discovery.get("token_endpoint")
         self.userinfo_url = discovery.get("userinfo_endpoint")
         auth_endpoint = discovery.get("authorization_endpoint")
+        self.issuer = discovery["issuer"]
+        self.jwks_uri = discovery["jwks_uri"]
+        self.signing_algorithms = [
+            algorithm for algorithm in discovery.get("id_token_signing_alg_values_supported", [])
+            if algorithm in ("RS256", "RS384", "RS512", "ES256", "ES384", "ES512")
+        ]
+        self.nonce = request.session.get("oidc_nonce")
+        if code is None:
+            self.nonce = secrets.token_urlsafe(32)
+            request.session["oidc_nonce"] = self.nonce
 
-        redirect_uri = f"{'https' if request.is_secure() else 'http'}://{request.get_host()}/auth/oidc/callback/"
+        callback_path = "/auth/spaces/oidc/callback/" if request.path.startswith("/auth/spaces/") else "/auth/oidc/callback/"
+        redirect_uri = f"{settings.WEB_URL.rstrip('/')}{callback_path}"
         url_params = {
             "client_id": OIDC_CLIENT_ID,
             "scope": self.scope,
             "redirect_uri": redirect_uri,
             "response_type": "code",
             "state": state,
+            "nonce": self.nonce,
         }
         auth_url = f"{auth_endpoint}?{urlencode(url_params)}"
 
@@ -90,6 +113,25 @@ class OIDCOAuthProvider(OauthAdapter):
         }
         headers = {"Accept": "application/json"}
         token_response = self.get_user_token(data=data, headers=headers)
+        try:
+            if not token_response.get("access_token") or not self.nonce or not self.signing_algorithms:
+                raise ValueError("Incomplete OIDC token response")
+            id_token = token_response["id_token"]
+            key = jwt.PyJWKClient(self.jwks_uri, timeout=15).get_signing_key_from_jwt(id_token)
+            self.id_claims = jwt.decode(
+                id_token, key.key, algorithms=self.signing_algorithms,
+                audience=self.client_id, issuer=self.issuer,
+                options={"require": ["exp", "iat", "iss", "aud", "sub"]},
+            )
+            if self.id_claims.get("nonce") != self.nonce:
+                raise ValueError("OIDC nonce mismatch")
+            if self.id_claims.get("azp", self.client_id) != self.client_id:
+                raise ValueError("OIDC authorized party mismatch")
+        except (jwt.PyJWTError, ValueError, KeyError, TypeError):
+            raise AuthenticationException(
+                error_code=AUTHENTICATION_ERROR_CODES["OIDC_OAUTH_PROVIDER_ERROR"],
+                error_message="OIDC_OAUTH_PROVIDER_ERROR: Invalid ID token",
+            )
         super().set_token_data(
             {
                 "access_token": token_response.get("access_token"),
@@ -108,10 +150,10 @@ class OIDCOAuthProvider(OauthAdapter):
         user_info_response = self.get_user_response()
 
         email = user_info_response.get("email")
-        if not email:
+        if not email or user_info_response.get("sub") != self.id_claims["sub"] or user_info_response.get("email_verified") is False:
             raise AuthenticationException(
                 error_code=AUTHENTICATION_ERROR_CODES["OIDC_NOT_CONFIGURED"],
-                error_message="OIDC_NOT_CONFIGURED: No email in userinfo response",
+                error_message="OIDC_NOT_CONFIGURED: Invalid userinfo identity or email",
             )
 
         first_name = user_info_response.get("given_name", "")
@@ -135,3 +177,38 @@ class OIDCOAuthProvider(OauthAdapter):
                 },
             }
         )
+
+    def authentication_error_code(self) -> str:
+        return "OIDC_OAUTH_PROVIDER_ERROR"
+
+    def get_user_token(self, data: dict[str, Any], headers: dict[str, str] | None = None) -> dict[str, Any]:
+        try:
+            response = requests.post(self.token_url, data=data, headers=headers, timeout=15)
+            response.raise_for_status()
+            result = response.json()
+            if not isinstance(result, dict):
+                raise ValueError("Invalid token response")
+            return result
+        except (requests.RequestException, ValueError):
+            raise AuthenticationException(
+                error_code=AUTHENTICATION_ERROR_CODES["OIDC_OAUTH_PROVIDER_ERROR"],
+                error_message="OIDC_OAUTH_PROVIDER_ERROR: Token exchange failed",
+            )
+
+    def get_user_response(self) -> dict[str, Any]:
+        try:
+            response = requests.get(
+                self.userinfo_url,
+                headers={"Authorization": f"Bearer {self.token_data['access_token']}"},
+                timeout=15,
+            )
+            response.raise_for_status()
+            result = response.json()
+            if not isinstance(result, dict):
+                raise ValueError("Invalid userinfo response")
+            return result
+        except (requests.RequestException, ValueError):
+            raise AuthenticationException(
+                error_code=AUTHENTICATION_ERROR_CODES["OIDC_OAUTH_PROVIDER_ERROR"],
+                error_message="OIDC_OAUTH_PROVIDER_ERROR: Userinfo request failed",
+            )

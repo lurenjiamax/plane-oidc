@@ -56,10 +56,10 @@ class OIDCCallbackSpaceEndpoint(View):
     def get(self, request):
         code = request.GET.get("code")
         state = request.GET.get("state")
-        base_host_url = request.session.get("host") or "https://plane.design4paragon.com"
+        base_host_url = base_host(request=request, is_space=True)
         next_path = request.session.get("next_path")
 
-        if state != request.session.get("state", ""):
+        if not state or state != request.session.pop("state", None):
             exc = AuthenticationException(
                 error_code=AUTHENTICATION_ERROR_CODES["OIDC_OAUTH_PROVIDER_ERROR"],
                 error_message="OIDC_OAUTH_PROVIDER_ERROR",
@@ -84,6 +84,7 @@ class OIDCCallbackSpaceEndpoint(View):
         try:
             provider = OIDCOAuthProvider(request=request, code=code, callback=post_user_auth_workflow)
             user = provider.authenticate()
+            request.session.pop("oidc_nonce", None)
             user_login(request=request, user=user, is_space=True)
             if next_path:
                 path = str(validate_next_path(next_path))
